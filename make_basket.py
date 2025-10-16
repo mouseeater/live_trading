@@ -1,462 +1,232 @@
-import mojito
-import json
-import time
-import threading
-from typing import Dict, List, Tuple
-from queue import Queue
-import websocket
+sample_price = {
+        "삼성전자": {"price": 95000, "code": "005930"},
+        "삼성바이오로직스": {"price": 1127000, "code": "207940"},
+        "삼성물산": {"price": 206000, "code": "028260"},
+        "삼성화재": {"price": 447500, "code": "000810"},
+        "삼성중공업": {"price": 21550, "code": "010140"},
+        "삼성생명": {"price": 162200, "code": "032830"},
+        "삼성SDI": {"price": 221500, "code": "006400"},
+        "삼성전기": {"price": 200000, "code": "009150"},
+        "삼성에스디에스": {"price": 165100, "code": "018260"},
+        "삼성증권": {"price": 74900, "code": "016360"},
+        "삼성E&A": {"price": 28300, "code": "028050"},
+        "에스원": {"price": 76500, "code": "012750"},
+        "호텔신라": {"price": 49800, "code": "008770"},
+        "제일기획": {"price": 20200, "code": "030000"},
+        "삼성카드": {"price": 49300, "code": "029780"}
+    }
 
-class SamsungETFBasketTrader:
-    """Kodex 삼성그룹 ETF 바스켓 매수 클래스 (웹소켓 + REST API)"""
+def calculate_total_market_cap():
+    """각 종목의 price와 quantity를 곱한 시가총액의 합을 계산하는 함수"""
+    import pandas as pd
     
-    def __init__(self, key: str, secret: str, acc_no: str, 
-                 total_investment_amount: int, mock: bool = True):
-        """
-        Args:
-            key: API Key
-            secret: API Secret
-            acc_no: 계좌번호
-            total_investment_amount: 총 투자금액 (원)
-            mock: 모의투자 여부
-        """
-        self.broker = mojito.KoreaInvestment(
-            api_key=key,
-            api_secret=secret,
-            acc_no=acc_no,
-            mock=mock
-        )
-        self.api_key = key
-        self.api_secret = secret
-        self.total_investment = total_investment_amount
-        self.mock = mock
-        
-        # ETF 구성종목
-        self.constituents = [
-            "삼성E&A", "삼성SDI", "삼성물산", "삼성바이오로직스", 
-            "삼성생명", "삼성에스디에스", "삼성전기", "삼성전자",
-            "삼성중공업", "삼성증권", "삼성카드", "삼성화재",
-            "에스원", "제일기획", "호텔신라"
-        ]
-        
-        # 종목코드 매핑
-        self.stock_codes = {
-            "삼성전자": "005930",
-            "삼성바이오로직스": "207940",
-            "삼성SDI": "006400",
-            "삼성물산": "028260",
-            "삼성전기": "009150",
-            "삼성생명": "032830",
-            "삼성화재": "000810",
-            "삼성에스디에스": "018260",
-            "호텔신라": "008770",
-            "삼성증권": "016360",
-            "삼성카드": "029780",
-            "삼성E&A": "028050",
-            "제일기획": "030000",
-            "에스원": "012750",
-            "삼성중공업": "010140"
-        }
-        
-        # 실시간 시세 저장소
-        self.realtime_prices = {}
-        self.price_ready = threading.Event()
-        self.ws = None
-        self.ws_approval_key = None
-        
-    def get_composition_ratios(self) -> Dict[str, float]:
-        """ETF 구성비율 반환 (외부 구현 가정)"""
-        raise NotImplementedError("구성비율 조회 함수를 구현해야 합니다")
-    
-    def get_websocket_approval_key(self) -> str:
-        """웹소켓 접속키 발급"""
-        try:
-            url = "https://openapi.koreainvestment.com:9443" if not self.mock else \
-                  "https://openapivts.koreainvestment.com:29443"
-            
-            import requests
-            headers = {
-                "content-type": "application/json"
-            }
-            body = {
-                "grant_type": "client_credentials",
-                "appkey": self.api_key,
-                "secretkey": self.api_secret
-            }
-            
-            response = requests.post(
-                f"{url}/oauth2/Approval",
-                headers=headers,
-                data=json.dumps(body)
-            )
-            
-            if response.status_code == 200:
-                approval_key = response.json()['approval_key']
-                print(f"✅ 웹소켓 접속키 발급 완료: {approval_key[:20]}...")
-                return approval_key
-            else:
-                raise Exception(f"접속키 발급 실패: {response.text}")
-                
-        except Exception as e:
-            print(f"❌ 웹소켓 접속키 발급 오류: {e}")
-            raise
-    
-    def on_message(self, ws, message):
-        """웹소켓 메시지 수신 처리"""
-        try:
-            if message.startswith("0|"):  # PINGPONG
-                ws.send("1|")  # PONG 응답
-                return
-            
-            # 실시간 시세 데이터 파싱
-            tokens = message.split("|")
-            if len(tokens) >= 4:
-                recv_type = tokens[0]
-                
-                # 실시간 체결가 (H0STCNT0)
-                if recv_type == "0" or recv_type == "1":
-                    data = tokens[3]
-                    
-                    # 데이터 파싱 (고정길이 형식)
-                    stock_code = data[0:6]
-                    current_price = int(data[38:48].strip())
-                    
-                    # 종목명 찾기
-                    stock_name = None
-                    for name, code in self.stock_codes.items():
-                        if code == stock_code:
-                            stock_name = name
-                            break
-                    
-                    if stock_name:
-                        self.realtime_prices[stock_name] = current_price
-                        print(f"📊 {stock_name:15s} | {stock_code} | {current_price:,}원")
-                        
-                        # 모든 종목의 시세가 수신되었는지 확인
-                        if len(self.realtime_prices) == len(self.constituents):
-                            print(f"\n✅ 전체 {len(self.constituents)}개 종목 시세 수신 완료!\n")
-                            self.price_ready.set()
-                            
-        except Exception as e:
-            print(f"⚠️ 메시지 처리 오류: {e}")
-    
-    def on_error(self, ws, error):
-        """웹소켓 에러 처리"""
-        print(f"❌ 웹소켓 에러: {error}")
-    
-    def on_close(self, ws, close_status_code, close_msg):
-        """웹소켓 종료 처리"""
-        print(f"🔌 웹소켓 연결 종료: {close_status_code} - {close_msg}")
-    
-    def on_open(self, ws):
-        """웹소켓 연결 시작"""
-        print("🔗 웹소켓 연결 성공")
-        print(f"📡 {len(self.constituents)}개 종목 실시간 시세 구독 시작...\n")
-        
-        # 각 종목에 대해 실시간 체결가 구독
-        for stock_name in self.constituents:
-            stock_code = self.stock_codes[stock_name]
-            
-            subscribe_data = {
-                "header": {
-                    "approval_key": self.ws_approval_key,
-                    "custtype": "P",
-                    "tr_type": "1",  # 등록
-                    "content-type": "utf-8"
-                },
-                "body": {
-                    "input": {
-                        "tr_id": "H0STCNT0",  # 실시간 체결가
-                        "tr_key": stock_code
-                    }
-                }
-            }
-            
-            ws.send(json.dumps(subscribe_data))
-            time.sleep(0.05)  # 구독 요청 간 딜레이
-    
-    def start_websocket(self):
-        """웹소켓 시작"""
-        try:
-            # 접속키 발급
-            self.ws_approval_key = self.get_websocket_approval_key()
-            
-            # 웹소켓 URL
-            ws_url = "ws://ops.koreainvestment.com:21000" if not self.mock else \
-                     "ws://ops.koreainvestment.com:31000"
-            
-            # 웹소켓 연결
-            self.ws = websocket.WebSocketApp(
-                ws_url,
-                on_message=self.on_message,
-                on_error=self.on_error,
-                on_close=self.on_close,
-                on_open=self.on_open
-            )
-            
-            # 별도 스레드에서 웹소켓 실행
-            ws_thread = threading.Thread(target=self.ws.run_forever)
-            ws_thread.daemon = True
-            ws_thread.start()
-            
-            print("⏳ 실시간 시세 수신 대기 중...\n")
-            
-        except Exception as e:
-            print(f"❌ 웹소켓 시작 오류: {e}")
-            raise
-    
-    def stop_websocket(self):
-        """웹소켓 종료"""
-        if self.ws:
-            # 모든 종목 구독 해제
-            for stock_name in self.constituents:
-                stock_code = self.stock_codes[stock_name]
-                
-                unsubscribe_data = {
-                    "header": {
-                        "approval_key": self.ws_approval_key,
-                        "custtype": "P",
-                        "tr_type": "2",  # 해제
-                        "content-type": "utf-8"
-                    },
-                    "body": {
-                        "input": {
-                            "tr_id": "H0STCNT0",
-                            "tr_key": stock_code
-                        }
-                    }
-                }
-                
-                self.ws.send(json.dumps(unsubscribe_data))
-                time.sleep(0.05)
-            
-            self.ws.close()
-            print("\n🔌 웹소켓 연결 종료")
-    
-    def calculate_quantities(self, 
-                            composition_ratios: Dict[str, float]) -> List[Tuple[str, str, int, int, int]]:
-        """
-        실시간 시세를 이용한 매수 수량 계산
-        """
-        basket_info = []
-        
-        print("[수량 계산 시작]")
-        print("-" * 80)
-        
-        for stock_name in self.constituents:
-            stock_code = self.stock_codes[stock_name]
-            
-            # 웹소켓으로 받은 실시간 시세 사용
-            current_price = self.realtime_prices.get(stock_name, 0)
-            
-            if current_price == 0:
-                print(f"⚠️ {stock_name}: 시세 정보 없음 (스킵)")
-                continue
-            
-            # 투자금액 계산
-            ratio = composition_ratios.get(stock_name, 0) / 100
-            investment_amount = int(self.total_investment * ratio)
-            
-            # 매수 수량 계산
-            quantity = investment_amount // current_price
-            actual_amount = quantity * current_price
-            
-            basket_info.append((
-                stock_name,
-                stock_code,
-                current_price,
-                quantity,
-                actual_amount
-            ))
-            
-            print(f"{stock_name:15s} | {stock_code} | "
-                  f"현재가: {current_price:,}원 | "
-                  f"비율: {composition_ratios.get(stock_name, 0):.2f}% | "
-                  f"수량: {quantity:,}주 | "
-                  f"금액: {actual_amount:,}원")
-        
-        return basket_info
-    
-    def execute_basket_order(self, 
-                            basket_info: List[Tuple[str, str, int, int, int]],
-                            order_delay: float = 0.2) -> Dict:
-        """
-        REST API를 통한 바스켓 주문 실행
-        
-        Args:
-            basket_info: 매수 정보
-            order_delay: 주문 간 딜레이 (초)
-        """
-        order_results = {
-            "success": [],
-            "failed": [],
-            "total_ordered_amount": 0
-        }
-        
-        print("\n[주문 실행 시작]")
-        print("-" * 80)
-        
-        for stock_name, stock_code, current_price, quantity, _ in basket_info:
-            if quantity == 0:
-                print(f"⏭️ {stock_name}: 매수 수량 0주 (스킵)")
-                continue
-            
-            try:
-                # REST API로 시장가 매수 주문
-                resp = self.broker.create_market_buy_order(
-                    symbol=stock_code,
-                    quantity=quantity
-                )
-                
-                if resp.get('rt_cd') == '0':
-                    order_no = resp.get('output', {}).get('ODNO', '')
-                    order_results["success"].append({
-                        "stock_name": stock_name,
-                        "stock_code": stock_code,
-                        "quantity": quantity,
-                        "price": current_price,
-                        "order_no": order_no
-                    })
-                    order_results["total_ordered_amount"] += (quantity * current_price)
-                    print(f"✅ {stock_name:15s} | {quantity:,}주 매수 주문 완료 (주문번호: {order_no})")
-                else:
-                    error_msg = resp.get('msg1', '알 수 없는 오류')
-                    order_results["failed"].append({
-                        "stock_name": stock_name,
-                        "stock_code": stock_code,
-                        "error": error_msg
-                    })
-                    print(f"❌ {stock_name:15s} | 주문 실패: {error_msg}")
-                
-                # API 호출 제한 방지를 위한 딜레이
-                time.sleep(order_delay)
-                
-            except Exception as e:
-                order_results["failed"].append({
-                    "stock_name": stock_name,
-                    "stock_code": stock_code,
-                    "error": str(e)
-                })
-                print(f"⚠️ {stock_name:15s} | 주문 오류: {e}")
-        
-        return order_results
-    
-    def create_basket(self, 
-                     composition_ratios: Dict[str, float],
-                     timeout: int = 60,
-                     order_delay: float = 0.2) -> Dict:
-        """
-        ETF 바스켓 생성 (웹소켓 + REST API)
-        
-        Args:
-            composition_ratios: 구성비율
-            timeout: 시세 수신 대기 시간 (초)
-            order_delay: 주문 간 딜레이 (초)
-        """
-        print("=" * 80)
-        print("Kodex 삼성그룹 ETF 바스켓 매수 시작")
-        print("=" * 80)
-        print(f"💰 총 투자금액: {self.total_investment:,}원")
-        print(f"📊 전략: 웹소켓 실시간 시세 + REST API 주문")
-        print(f"🎯 대상 종목: {len(self.constituents)}개")
-        print("=" * 80)
-        print()
-        
-        try:
-            # 1. 웹소켓 시작 및 실시간 시세 수신
-            print("[1단계] 웹소켓 실시간 시세 수신")
-            print("-" * 80)
-            self.start_websocket()
-            
-            # 모든 종목의 시세가 수신될 때까지 대기
-            if not self.price_ready.wait(timeout=timeout):
-                print(f"⚠️ {timeout}초 내에 모든 시세를 받지 못했습니다.")
-                print(f"   수신된 종목: {len(self.realtime_prices)}/{len(self.constituents)}")
-            
-            # 2. 매수 수량 계산
-            print("\n[2단계] 종목별 매수 수량 계산")
-            print("-" * 80)
-            basket_info = self.calculate_quantities(composition_ratios)
-            
-            # 총 투자금액 확인
-            total_calculated = sum(amount for _, _, _, _, amount in basket_info)
-            print(f"\n💵 계산된 총 매수금액: {total_calculated:,}원")
-            print(f"📊 실제 투자금액 대비: {total_calculated / self.total_investment * 100:.2f}%")
-            
-            # 3. REST API로 주문 실행
-            print("\n[3단계] REST API 주문 실행")
-            print("-" * 80)
-            order_results = self.execute_basket_order(basket_info, order_delay=order_delay)
-            
-            # 4. 웹소켓 종료
-            self.stop_websocket()
-            
-            # 5. 결과 요약
-            print("\n" + "=" * 80)
-            print("📋 주문 결과 요약")
-            print("=" * 80)
-            print(f"✅ 성공: {len(order_results['success'])}건")
-            print(f"❌ 실패: {len(order_results['failed'])}건")
-            print(f"💰 총 주문금액: {order_results['total_ordered_amount']:,}원")
-            
-            if order_results['failed']:
-                print("\n실패 종목 상세:")
-                for failed in order_results['failed']:
-                    print(f"  - {failed['stock_name']}: {failed['error']}")
-            
-            print("=" * 80)
-            
-            return order_results
-            
-        except Exception as e:
-            print(f"\n❌ 바스켓 생성 중 오류 발생: {e}")
-            self.stop_websocket()
-            raise
-
-
-# 사용 예시
-if __name__ == "__main__":
-    # API 인증 정보
-    API_KEY = "YOUR_API_KEY"
-    API_SECRET = "YOUR_API_SECRET"
-    ACCOUNT_NO = "YOUR_ACCOUNT_NUMBER"
-    
-    # 바스켓 트레이더 초기화
-    trader = SamsungETFBasketTrader(
-        key="PSVP4uaIGfmv9oviIqOjn58WIV3coGzjAEqu",
-        secret="NYuz2xS/ZFfTnLBa15UsPnU/iFaGMMAQiv/RoB4Xxi2yHOCCY1Zq9IgJARubfjWXzoFUbun4wlG7xhDQyWXIvSaWkK27RkFz8k4TBYpOtNzcRCeW17eBpQ1GULQkqP3AUultGWtcycBDkL/KHcPAga53hK37kM4YcSEsjoZgncVb6yO2DOc=",
-        acc_no="50154524-01",
-        total_investment_amount=10_000_000,  # 1천만원
-        mock=True  # 모의투자
-    )
-    
-    # 구성비율 (예시 - 실제로는 get_composition_ratios() 구현 필요)
-    composition_ratios = {
-        "삼성전자": 60.0,
-        "삼성바이오로직스": 10.0,
-        "삼성SDI": 5.0,
-        "삼성물산": 4.0,
-        "삼성전기": 3.5,
-        "삼성생명": 3.0,
-        "삼성화재": 2.5,
-        "삼성에스디에스": 2.5,
-        "호텔신라": 2.0,
-        "삼성증권": 2.0,
-        "삼성카드": 1.5,
-        "삼성E&A": 1.5,
-        "제일기획": 1.0,
-        "에스원": 1.0,
-        "삼성중공업": 0.5
+    # ETF 구성 종목 및 수량
+    ETF_COMPOSITION = {
+        "삼성전자": {"quantity": 3845, "code": "005930"},
+        "삼성바이오로직스": {"quantity": 119, "code": "207940"},
+        "삼성물산": {"quantity": 601, "code": "028260"},
+        "삼성화재": {"quantity": 202, "code": "000810"},
+        "삼성중공업": {"quantity": 4341, "code": "010140"},
+        "삼성생명": {"quantity": 560, "code": "032830"},
+        "삼성SDI": {"quantity": 391, "code": "006400"},
+        "삼성전기": {"quantity": 363, "code": "009150"},
+        "삼성에스디에스": {"quantity": 253, "code": "018260"},
+        "삼성증권": {"quantity": 405, "code": "016360"},
+        "삼성E&A": {"quantity": 1006, "code": "028050"},
+        "에스원": {"quantity": 160, "code": "012750"},
+        "호텔신라": {"quantity": 201, "code": "008770"},
+        "제일기획": {"quantity": 452, "code": "030000"},
+        "삼성카드": {"quantity": 154, "code": "029780"}
     }
     
-    # 바스켓 생성 실행
-    results = trader.create_basket(
-        composition_ratios=composition_ratios,
-        timeout=60,  # 시세 수신 대기 60초
-        order_delay=0.2  # 주문 간 0.2초 딜레이
-    )
+    # 데이터 저장용 리스트
+    data = []
+    total_market_cap = 0
     
-    # 결과 저장
-    with open("basket_order_results.json", "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    # 각 종목별 시가총액 계산
+    for stock_name in ETF_COMPOSITION:
+        if stock_name in sample_price:
+            price = sample_price[stock_name]["price"]
+            quantity = ETF_COMPOSITION[stock_name]["quantity"]
+            market_cap = price * quantity
+            total_market_cap += market_cap
+            
+            data.append({
+                '종목명': stock_name,
+                '종목코드': ETF_COMPOSITION[stock_name]["code"],
+                '가격': price,
+                '수량': quantity,
+                '시가총액': market_cap
+            })
     
-    print("\n✅ 결과가 basket_order_results.json에 저장되었습니다.")
+    # DataFrame 생성
+    df = pd.DataFrame(data)
+    
+    # 비중 계산 (백분율)
+    df['비중(%)'] = (df['시가총액'] / total_market_cap * 100).round(2)
+    
+    # 컬럼 순서 재정렬
+    df = df[['종목명', '종목코드', '가격', '수량', '시가총액', '비중(%)']]
+    
+    return df, total_market_cap
+
+def make_basket() :
+    
+    df, total_market_cap = calculate_total_market_cap()
+    
+    print("=== ETF 구성 종목별 시가총액 및 비중 ===")
+    print(df.to_string(index=False))
+    print(f"\n총 시가총액: {total_market_cap:,}원")
+    
+    return df, total_market_cap
+
+def create_minimum_cost_portfolio(target_df, tolerance=1.0):
+    """
+    삼성카드를 기준으로 역산하여 최소 비용 포트폴리오를 생성
+    
+    Args:
+        target_df: 목표 비중이 포함된 DataFrame
+        tolerance: 허용 오차 범위 (%)
+    
+    Returns:
+        최적 포트폴리오 DataFrame, 총 비용
+    """
+    import pandas as pd
+    import math
+    
+    print("🔍 삼성카드 기준 역산 방식으로 최적화 시도")
+    print("="*70)
+    
+    # 삼성카드 정보 찾기
+    samsung_card_row = target_df[target_df['종목명'] == '삼성카드'].iloc[0]
+    samsung_card_weight = samsung_card_row['비중(%)']
+    samsung_card_price = samsung_card_row['가격']
+    
+    print(f"기준 종목: 삼성카드 (목표 비중: {samsung_card_weight:.2f}%, 가격: {samsung_card_price:,}원)")
+    
+    best_portfolio = None
+    best_cost = float('inf')
+    best_error = float('inf')
+    
+    # 삼성카드를 1개부터 시작해서 최적해 찾기
+    for samsung_card_quantity in range(1, 21):  # 1~20개까지 시도
+        samsung_card_cost = samsung_card_price * samsung_card_quantity
+        
+        # 전체 포트폴리오 시가총액 역산
+        total_portfolio_value = samsung_card_cost / (samsung_card_weight / 100)
+        
+        print(f"\n--- 삼성카드 {samsung_card_quantity}개 ({samsung_card_cost:,}원) 기준으로 계산 ---")
+        print(f"역산된 전체 포트폴리오 가치: {total_portfolio_value:,.0f}원")
+        
+        portfolio_data = []
+        actual_total_cost = 0
+        
+        for _, row in target_df.iterrows():
+            stock_name = row['종목명']
+            target_weight = row['비중(%)']
+            stock_price = row['가격']
+            stock_code = row['종목코드']
+            
+            if stock_name == '삼성카드':
+                quantity = samsung_card_quantity
+                cost = samsung_card_cost
+            else:
+                # 목표 비중에 따른 투자금액 계산
+                target_investment = total_portfolio_value * (target_weight / 100)
+                # 필요한 주식 수량 계산
+                quantity = max(1, round(target_investment / stock_price))
+                cost = stock_price * quantity
+            
+            actual_total_cost += cost
+            
+            portfolio_data.append({
+                '종목명': stock_name,
+                '종목코드': stock_code,
+                '가격': stock_price,
+                '수량': quantity,
+                '투자금액': cost,
+                '목표비중(%)': target_weight
+            })
+        
+        # 실제 비중 계산
+        portfolio_df = pd.DataFrame(portfolio_data)
+        portfolio_df['실제비중(%)'] = (portfolio_df['투자금액'] / actual_total_cost * 100).round(2)
+        portfolio_df['오차(%)'] = (portfolio_df['실제비중(%)'] - portfolio_df['목표비중(%)']).round(2)
+        portfolio_df['오차절댓값'] = abs(portfolio_df['오차(%)'])
+        
+        max_error = portfolio_df['오차절댓값'].max()
+        avg_error = portfolio_df['오차절댓값'].mean()
+        
+        print(f"실제 총 투자금액: {actual_total_cost:,}원")
+        print(f"최대 오차: {max_error:.2f}%")
+        print(f"평균 오차: {avg_error:.2f}%")
+        
+        # 최적해 업데이트
+        if max_error < best_error or (max_error == best_error and actual_total_cost < best_cost):
+            best_error = max_error
+            best_portfolio = portfolio_df.copy()
+            best_cost = actual_total_cost
+        
+        # 허용 오차 내에 있는지 확인 (모든 종목이 1% 이내여야 함)
+        stocks_within_tolerance = portfolio_df[portfolio_df['오차절댓값'] <= tolerance]
+        stocks_over_tolerance = portfolio_df[portfolio_df['오차절댓값'] > tolerance]
+        
+        print(f"허용 오차 {tolerance}% 이내 종목: {len(stocks_within_tolerance)}개")
+        print(f"허용 오차 {tolerance}% 초과 종목: {len(stocks_over_tolerance)}개")
+        
+        if len(stocks_over_tolerance) == 0:
+            print(f"✅ 성공! 모든 종목이 허용 오차 {tolerance}% 이내입니다.")
+            final_df = portfolio_df[['종목명', '종목코드', '가격', '수량', '투자금액', '목표비중(%)', '실제비중(%)', '오차(%)']]
+            return final_df, actual_total_cost
+        else:
+            # 오차 초과 종목들 출력 (상위 5개까지만)
+            top_error_stocks = stocks_over_tolerance.nlargest(5, '오차절댓값')
+            print("주요 오차 초과 종목들:")
+            for _, stock in top_error_stocks.iterrows():
+                print(f"  {stock['종목명']}: 목표 {stock['목표비중(%)']}% vs 실제 {stock['실제비중(%)']}% (오차: {stock['오차(%)']}%)")
+    
+    # 허용 오차 내 해를 찾지 못한 경우 최선의 결과 반환
+    print(f"\n⚠️ 허용 오차 {tolerance}% 내 해를 찾지 못했습니다.")
+    print(f"🔶 최선의 결과 (최대 오차 {best_error:.2f}%)")
+    
+    if best_portfolio is not None:
+        final_df = best_portfolio[['종목명', '종목코드', '가격', '수량', '투자금액', '목표비중(%)', '실제비중(%)', '오차(%)']]
+        return final_df, best_cost
+    
+    print("❌ 해를 찾지 못했습니다.")
+    return None, 0
+
+if __name__ == "__main__":
+    # 함수 실행 및 결과 확인
+    print("ETF 바스켓 구성 분석을 시작합니다...\n")
+    
+    # 원본 ETF 구성 분석
+    df, total_cap = make_basket()
+    
+    print("\n" + "="*70)
+    print("삼성카드 기준 역산 방식 최소 비용 포트폴리오 생성")
+    print("="*70)
+    
+    # 삼성카드 기준 역산 방식 최소 비용 포트폴리오 생성
+    optimal_portfolio, optimal_cost = create_minimum_cost_portfolio(df, tolerance=1.0)
+    
+    if optimal_portfolio is not None:
+        print("\n" + "="*70)
+        print("🎯 최적 포트폴리오 결과")
+        print("="*70)
+        print(optimal_portfolio.to_string(index=False))
+        print(f"\n💰 총 투자 필요 금액: {optimal_cost:,}원")
+        print(f"📊 원본 ETF 대비 비용 절감: {total_cap - optimal_cost:,}원 ({((total_cap - optimal_cost) / total_cap * 100):.1f}%)")
+        
+        # 추가 분석
+        print(f"\n📈 포트폴리오 분석:")
+        print(f"   • 구성 종목 수: {len(optimal_portfolio)}개")
+        print(f"   • 최대 오차: {abs(optimal_portfolio['오차(%)']).max():.2f}%")
+        print(f"   • 평균 오차: {abs(optimal_portfolio['오차(%)']).mean():.2f}%")
+    else:
+        print("❌ 최적 포트폴리오를 찾지 못했습니다.")
+
+
+
+
+
