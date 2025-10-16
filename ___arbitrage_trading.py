@@ -302,7 +302,7 @@ def run_trading_logic():
             print(f"  - 괴리율   : {diff:+.2f} 원")
 
             # --- 매수 조건 ---
-            # 조건: NAV가 현재가보다 100원 이상 높고, 현재 보유하고 있지 않을 때
+            # 조건: NAV가 현재가보다 15원 이상 높고, 현재 보유하고 있지 않을 때
             if diff >= 15 and position == "none":
                 print("  >> 매수 신호 발생 (NAV - 현재가 >= 100)")
                 result = buy_stock(stock_code=STOCK_CODE, quantity=1)

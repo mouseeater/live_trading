@@ -1,2 +1,0 @@
-# live_trading
-go
